@@ -1,0 +1,9 @@
+services:
+  trading_sys:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - .:/app
+    environment:
+      - DAGSTER_HOME=/app/dagster_home
