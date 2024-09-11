@@ -4,5 +4,6 @@ dagster-docker
 yfinance
 pandas
 pyarrow
+scipy
 scikit-learn
 matplotlib
