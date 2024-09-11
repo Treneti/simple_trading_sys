@@ -2,11 +2,10 @@ import os
 import pandas as pd
 import yfinance as yf
 from datetime import date
-from sklearn.ensemble import IsolationForest
 import pickle
 from scipy.stats import norm
 from dagster import asset, Definitions, define_asset_job, AssetSelection, ScheduleDefinition, DefaultScheduleStatus
-from scores_calculations import annualized_return, max_drawdown, annualized_volatility, annualized_sharpe_ratio, calmar_ratio, information_coefficient, hit_rate
+from scores_calculations import calculate_scores
 
 OUTDIR = '/app/data'
 TICKERS_LOAD_URL: str = 'https://en.wikipedia.org/wiki/List_of_S%26P_500_companies'
@@ -59,17 +58,15 @@ def combine_data():
 @asset(deps=[combine_data],group_name='strategy_calc')
 def clean_data():
     data = pd.read_parquet(f'{get_date_path()}/combined_data.parquet').set_index(['date','ticker'])
-    isolation_forest = IsolationForest(contamination=0.01, random_state=42)
-    predictions = isolation_forest.fit_predict(data)
-    cleaned_data = data[predictions == 1].copy()
-    cleaned_data['target_1d'] = cleaned_data['adj close'].groupby('ticker').pct_change()
-    cleaned_data.dropna().reset_index().to_parquet(f'{get_date_path()}/combined_cleaned_data.parquet')
+    data['return_1d'] = data['adj close'].groupby('ticker').pct_change()
+    data = data.loc[abs(data['return_1d'])<0.15]
+    data['target_1d'] = data['return_1d'].groupby('ticker').shift(-1)
+    data.dropna().reset_index().to_parquet(f'{get_date_path()}/combined_cleaned_data.parquet')
 
 @asset(deps=[clean_data],group_name='strategy_calc')
 def calc_strategy():
     # https://www.msci.com/documents/1296102/8473352/Volatility-brochure.pdf/f9cac8cb-f467-470d-9292-0298a597799e
     data = pd.read_parquet(f'{get_date_path()}/combined_cleaned_data.parquet').set_index(['date','ticker'])
-    data['return_1d'] = data['target_1d'].groupby('ticker').shift(1)
     data['volatilty_1y'] = data['return_1d'].groupby('ticker').ewm(halflife=126).std().droplevel(0)
     data['vol_perc'] = data['volatilty_1y'].groupby('date').rank(pct=True).dropna()
     data['alpha'] = data.groupby('date')['vol_perc'].transform(lambda x: norm.ppf(x.clip(lower=0.000001, upper=0.999999)))
@@ -80,19 +77,13 @@ def calc_scores():
     data = pd.read_parquet(f'{get_date_path()}/res_data.parquet').set_index(['date','ticker'])
     data['alpha_norm'] = data.groupby('date')['alpha'].transform(lambda x: x - x.mean())
     data['alpha_norm'] = data['alpha_norm'].groupby('date').transform(lambda x: x * (2 / x.abs().sum()))
-    
+    data.dropna().reset_index().to_parquet(f'{get_date_path()}/data_final.parquet')
+
     res_df = pd.DataFrame(((data['alpha_norm'] * data['target_1d']).groupby('date').sum()),columns=['returns'])
     res_df['pnl'] = (1 + res_df['returns'].cumsum())
     res_df.dropna().reset_index().to_parquet(f'{get_date_path()}/res_rets.parquet')
-    scores = {}
-    scores['sharpe'] = annualized_sharpe_ratio(res_df['returns'])
-    scores['max_dd'] = max_drawdown(res_df['returns'])
-    scores['volatility'] = annualized_volatility(res_df['returns'])
-    scores['ann_returns'] = annualized_return(res_df['returns'])
-    scores['calmar_ratio'] = calmar_ratio(res_df['returns'])
-    scores['information_coefficient']  = information_coefficient(data['alpha_norm'],data['target_1d'])
-    scores['hit_rate']  = hit_rate(data['alpha_norm'],data['target_1d'])
-    scores_df = pd.DataFrame.from_dict(scores, orient='index',columns=['score'])
+
+    scores_df = calculate_scores(res_df,data)
     scores_df.dropna().reset_index().to_parquet(f'{get_date_path()}/scores.parquet')    
 
 
